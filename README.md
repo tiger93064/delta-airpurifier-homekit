@@ -61,7 +61,7 @@ HomeSpan HAP 佔用 80，狀態／管理 API 在 8080。
 
 ## HomeSpan 設定過程
 
-燒錄 `esp32dev` 韌體並供電後，需完成兩步：**寫入家用 WiFi** → **用家庭 App 配對**。本專案已啟用 `enableAutoStartAP()`，並將板載 **BOOT（GPIO0）** 設為 Control 鍵。本專案未呼叫 `setStatusPin()`，一般 DevKit 可能看不到 HomeSpan 狀態 LED；可改看 Serial Monitor（115200）或直接依下方步驟操作。
+燒錄 `main` 韌體並供電後，需完成兩步：**寫入家用 WiFi** → **用家庭 App 配對**。本專案已啟用 `enableAutoStartAP()`，並將板載 **BOOT（GPIO0）** 設為 Control 鍵。本專案未呼叫 `setStatusPin()`，一般 DevKit 可能看不到 HomeSpan 狀態 LED；可改看 Serial Monitor（115200）或直接依下方步驟操作。
 
 ### 0. 事前準備
 
@@ -240,11 +240,11 @@ B ──────────────────────► 輸出�
 
 ## 建置與燒錄（PlatformIO）
 
-預設環境 `esp32dev` 編譯 HomeKit 主程式（排除 `demo`／`fan_*` 工具）。
+預設環境 `main` 編譯 HomeKit 主程式（排除 `demo`／`fan_*` 工具）。
 
 ```bash
-pio run -e esp32dev -t upload
-pio device monitor -e esp32dev
+pio run -e main -t upload
+pio device monitor -e main
 ```
 
 ### 輔助環境（無 HomeKit）

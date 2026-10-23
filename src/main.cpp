@@ -10,12 +10,22 @@
 #define DE_RE_PIN 4
 #define USE_RS485_DE_RE 0
 
+const uint8_t DELTA_FAN_ID = 0xC8; // 台達風機預設地址 200 (0xC8)
 
-const uint8_t DELTA_FAN_ID = 0xC8; // 台達風機預設地址 200 (0xC8)[cite: 8]
-const uint32_t POLL_INTERVAL = 10000; // 定時讀取狀態間隔 (10秒)
+// Modbus RTU @9600：幀間隙約數 ms 即可；重試時讓出網路再短等
+const uint32_t MODBUS_GAP_MS = 10;
+const uint32_t MODBUS_RETRY_MS = 30;
+const int MODBUS_MAX_RETRIES = 3;
+
+const uint32_t POLL_CONTROL_MS = 10000; // 控制／診斷巡檢
+const uint32_t POLL_FILTER_MS = 60000;  // 濾網（小時級變化，較疏）
+const uint32_t POLL_BACKOFF_MS = 30000; // 連續校正失敗後拉長間隔
+const int CORRECT_FAIL_THRESHOLD = 3;
+
+const uint32_t WIFI_AP_FALLBACK_MS = 20000; // 有存 WiFi 但連不上：20 秒後開設定熱點
 
 // VDB36AEXT-F 支援濾網功能
-const bool SUPPORT_FILTER_SERVICE = true; 
+const bool SUPPORT_FILTER_SERVICE = true;
 
 ModbusMaster node;
 // HomeSpan HAP 已佔用 80，JSON API 改用 8080
@@ -24,33 +34,59 @@ bool httpStarted = false;
 bool sawInvalidIp = false; // 曾拿到 0.0.0.0：HomeSpan 會在錯誤 IP 上啟動 mDNS，需重啟修復
 bool wifiEverConnected = false;
 bool apFallbackStarted = false;
-const uint32_t WIFI_AP_FALLBACK_MS = 20000; // 有存 WiFi 但連不上：20 秒後開設定熱點
+uint32_t lastModbusMs = 0;
+bool inHomeSpanPoll = false; // 避免 Modbus 重試讓出時重入 homeSpan.poll()
 
 // ================= 全域風機狀態暫存結構 (供 HTTP JSON 讀取) =================
 struct FanStateCache {
   bool modbusOnline = false;
-  uint16_t power = 0;           // 0x05: 0x00關, 0x01開[cite: 8]
-  uint16_t speedMode = 0;       // 0x06: 0x04多段調速, 0x05低風, 0x06高風, 0x07待機[cite: 8]
-  uint16_t speedLevel = 1;      // 0x07: 1~17[cite: 8]
+  uint16_t power = 0;           // 0x05: 0x00關, 0x01開
+  uint16_t speedMode = 0;       // 0x06: 0x04多段調速, 0x05低風, 0x06高風, 0x07待機
+  uint16_t speedLevel = 1;      // 0x07: 1~17
   int speedPercent = 0;         // HomeKit 對應百分比
-  uint16_t rpm = 0;             // 0x0D: 0~9999 rpm[cite: 8]
-  
-  uint16_t errorCode = 0;       // 0x10: 異常狀態原始值[cite: 8, 9]
-  bool tempError = false;       // Bit5: 溫度異常 (0x20)[cite: 9]
-  bool motorError = false;      // Bit7: 馬達異常 (0x80)[cite: 9]
+  uint16_t rpm = 0;             // 0x0D: 0~9999 rpm
 
-  uint16_t sysStatus = 0;       // 0x13: 系統狀態原始值[cite: 8, 9]
-  bool isRunning = false;       // Bit0: 運行狀態 (0x01)[cite: 9]
-  bool lowTempProtect = false;  // Bit6: 低溫保護 (0x40)[cite: 9]
-  bool halfSpeedSwitch = false; // Bit7: 半速開關 (0x80)[cite: 9]
+  uint16_t errorCode = 0;       // 0x10: 異常狀態原始值
+  bool tempError = false;       // Bit5: 溫度異常 (0x20)
+  bool motorError = false;      // Bit7: 馬達異常 (0x80)
 
-  uint16_t filterMaxHours = 2000; // 0x1C: 濾網設置時間[cite: 8]
-  uint16_t filterNeedChange = 0;  // 0x1D: 濾網更換提示[cite: 8]
-  uint16_t filterUsedHours = 0;   // 0x1E: 濾網使用時間[cite: 8]
+  uint16_t sysStatus = 0;       // 0x13: 系統狀態原始值
+  bool isRunning = false;       // Bit0: 運行狀態 (0x01)
+  bool lowTempProtect = false;  // Bit6: 低溫保護 (0x40)
+  bool halfSpeedSwitch = false; // Bit7: 半速開關 (0x80)
+
+  uint16_t filterMaxHours = 2000; // 0x1C: 濾網設置時間
+  uint16_t filterNeedChange = 0;  // 0x1D: 濾網更換提示
+  uint16_t filterUsedHours = 0;   // 0x1E: 濾網使用時間
   float filterLifePercent = 100.0f;
 } fanState;
 
 // ================= RS485 收發控制與通訊輔助函式 =================
+// 重試期間讓出：優先服務 HTTP；僅在非 HomeSpan 回呼內才再 poll
+void yieldNetwork() {
+  if (httpStarted) {
+    httpServer.handleClient();
+  }
+  if (!inHomeSpanPoll) {
+    inHomeSpanPoll = true;
+    homeSpan.poll();
+    inHomeSpanPoll = false;
+  } else {
+    yield();
+  }
+}
+
+void modbusGap() {
+  uint32_t elapsed = millis() - lastModbusMs;
+  if (elapsed < MODBUS_GAP_MS) {
+    delay(MODBUS_GAP_MS - elapsed);
+  }
+}
+
+void markModbusDone() {
+  lastModbusMs = millis();
+}
+
 void preTransmission() {
 #if USE_RS485_DE_RE
   digitalWrite(DE_RE_PIN, HIGH);
@@ -65,18 +101,50 @@ void postTransmission() {
 #endif
 }
 
-bool writeRegisterWithRetry(uint16_t reg, uint16_t val, int maxRetries = 3) {
+// HomeKit 1–100% → 風機檔位 1–17（整數均勻映射）
+uint16_t percentToFanLevel(int percent) {
+  if (percent <= 0) return 0;
+  if (percent > 100) percent = 100;
+  uint16_t level = (uint16_t)((percent * 17 + 99) / 100);
+  if (level < 1) level = 1;
+  if (level > 17) level = 17;
+  return level;
+}
+
+bool writeRegisterWithRetry(uint16_t reg, uint16_t val, int maxRetries = MODBUS_MAX_RETRIES) {
   for (int i = 0; i < maxRetries; i++) {
-    delay(30);
+    modbusGap();
     uint8_t result = node.writeSingleRegister(reg, val);
+    markModbusDone();
     if (result == node.ku8MBSuccess) {
       fanState.modbusOnline = true;
       return true;
     }
-    Serial.printf("[Modbus] 寫入 0x%02X 失敗 (錯誤碼: 0x%02X), 重試 %d/%d...\n", reg, result, i + 1, maxRetries);
-    delay(100);
+    Serial.printf("[Modbus] 寫入 0x%02X 失敗 (錯誤碼: 0x%02X), 重試 %d/%d...\n",
+                  reg, result, i + 1, maxRetries);
+    yieldNetwork();
+    delay(MODBUS_RETRY_MS);
   }
   fanState.modbusOnline = false;
+  return false;
+}
+
+bool readHoldingWithGap(uint16_t reg, uint8_t count) {
+  modbusGap();
+  uint8_t result = node.readHoldingRegisters(reg, count);
+  markModbusDone();
+  return result == node.ku8MBSuccess;
+}
+
+// 僅在尚未為多段調速時寫入 0x06
+bool ensureMultiSpeedMode() {
+  if (fanState.speedMode == 0x04) {
+    return true;
+  }
+  if (writeRegisterWithRetry(0x06, 0x04)) {
+    fanState.speedMode = 0x04;
+    return true;
+  }
   return false;
 }
 
@@ -255,7 +323,7 @@ struct DeltaFilterMaintenance : Service::FilterMaintenance {
   boolean update() override {
     if (resetFilter->updated() && resetFilter->getNewVal() == 1) {
       WEBLOG("[HomeKit] 指令：重置濾網計時");
-      if (writeRegisterWithRetry(0x1F, 0x5A)) { // 寫入 0x5A 重置濾網[cite: 8]
+      if (writeRegisterWithRetry(0x1F, 0x5A)) {
         filterChange->setVal(0);
         filterLife->setVal(100);
         fanState.filterNeedChange = 0;
@@ -272,24 +340,25 @@ struct DeltaFilterMaintenance : Service::FilterMaintenance {
   void pollFilterStatus() {
     if (!SUPPORT_FILTER_SERVICE) return;
 
-    delay(30);
-    uint8_t result = node.readHoldingRegisters(0x1C, 3); // 讀取 0x1C~0x1E[cite: 8]
-    if (result == node.ku8MBSuccess) {
-      fanState.filterMaxHours   = node.getResponseBuffer(0);
-      fanState.filterNeedChange = node.getResponseBuffer(1);
-      fanState.filterUsedHours  = node.getResponseBuffer(2);
+    if (!readHoldingWithGap(0x1C, 3)) {
+      WEBLOG("[Monitor] 濾網暫存器讀取失敗（保留上次值）");
+      return;
+    }
 
-      uint8_t changeVal = (fanState.filterNeedChange == 0x01) ? 1 : 0;
-      if (filterChange->getVal() != changeVal) {
-        filterChange->setVal(changeVal);
-      }
+    fanState.filterMaxHours   = node.getResponseBuffer(0);
+    fanState.filterNeedChange = node.getResponseBuffer(1);
+    fanState.filterUsedHours  = node.getResponseBuffer(2);
 
-      if (fanState.filterMaxHours > 0) {
-        float lifePercent = 100.0f - ((float)fanState.filterUsedHours / (float)fanState.filterMaxHours * 100.0f);
-        fanState.filterLifePercent = constrain(lifePercent, 0.0f, 100.0f);
-        if (abs(filterLife->getVal<float>() - fanState.filterLifePercent) >= 1.0f) {
-          filterLife->setVal(fanState.filterLifePercent);
-        }
+    uint8_t changeVal = (fanState.filterNeedChange == 0x01) ? 1 : 0;
+    if (filterChange->getVal() != changeVal) {
+      filterChange->setVal(changeVal);
+    }
+
+    if (fanState.filterMaxHours > 0) {
+      float lifePercent = 100.0f - ((float)fanState.filterUsedHours / (float)fanState.filterMaxHours * 100.0f);
+      fanState.filterLifePercent = constrain(lifePercent, 0.0f, 100.0f);
+      if (abs(filterLife->getVal<float>() - fanState.filterLifePercent) >= 1.0f) {
+        filterLife->setVal(fanState.filterLifePercent);
       }
     }
   }
@@ -307,6 +376,9 @@ struct DeltaAirPurifier : Service::AirPurifier {
 
   DeltaFilterMaintenance *filterService;
   uint32_t lastPollTime = 0;
+  uint32_t lastFilterPollTime = 0;
+  uint32_t currentPollInterval = POLL_CONTROL_MS;
+  int correctFailCount = 0;
   bool isInitialized = false;
 
   DeltaAirPurifier(DeltaFilterMaintenance *filter = nullptr) : Service::AirPurifier() {
@@ -319,23 +391,71 @@ struct DeltaAirPurifier : Service::AirPurifier {
   }
 
   void initOnBoot() {
-    writeRegisterWithRetry(0x06, 0x04); // 設定為多段調速[cite: 8, 10]
-    fanState.speedMode = 0x04;
+    ensureMultiSpeedMode();
 
     int savedSpeed = (int)rotationSpeed->getVal();
     if (savedSpeed > 0) {
-      uint16_t fanLevel = map(savedSpeed, 1, 100, 1, 17); // 1~17 檔位[cite: 8, 9]
+      uint16_t fanLevel = percentToFanLevel(savedSpeed);
       writeRegisterWithRetry(0x07, fanLevel);
       fanState.speedLevel = fanLevel;
       fanState.speedPercent = savedSpeed;
     }
 
     int savedActive = active->getVal();
-    writeRegisterWithRetry(0x05, (savedActive == 1) ? 0x01 : 0x00); // 開關機[cite: 8, 10]
+    writeRegisterWithRetry(0x05, (savedActive == 1) ? 0x01 : 0x00);
     fanState.power = (savedActive == 1) ? 0x01 : 0x00;
     currentState->setVal(savedActive ? 2 : 0);
 
     isInitialized = true;
+  }
+
+  // 只寫與 HomeKit 不符的暫存器；回傳是否全部成功
+  bool correctToHomeKit(uint16_t actualPower, uint16_t actualMode, uint16_t actualLevel) {
+    uint16_t targetPower = (active->getVal() == 1) ? 0x01 : 0x00;
+    uint16_t targetLevel = percentToFanLevel((int)rotationSpeed->getVal());
+    bool ok = true;
+    char wrote[48];
+    wrote[0] = '\0';
+    size_t n = 0;
+
+    if (actualMode != 0x04) {
+      if (writeRegisterWithRetry(0x06, 0x04)) {
+        fanState.speedMode = 0x04;
+        n += snprintf(wrote + n, sizeof(wrote) - n, "0x06 ");
+      } else {
+        ok = false;
+      }
+    }
+
+    if (ok && targetPower == 0x01 && actualLevel != targetLevel) {
+      if (writeRegisterWithRetry(0x07, targetLevel)) {
+        fanState.speedLevel = targetLevel;
+        fanState.speedPercent = (int)rotationSpeed->getVal();
+        n += snprintf(wrote + n, sizeof(wrote) - n, "0x07 ");
+      } else {
+        ok = false;
+      }
+    }
+
+    if (ok && actualPower != targetPower) {
+      if (writeRegisterWithRetry(0x05, targetPower)) {
+        fanState.power = targetPower;
+        n += snprintf(wrote + n, sizeof(wrote) - n, "0x05 ");
+      } else {
+        ok = false;
+      }
+    }
+
+    if (n == 0) {
+      WEBLOG("[Monitor] 校正：無需寫入");
+    } else {
+      WEBLOG("[Monitor] 校正寫入：%s%s", wrote, ok ? "成功" : "失敗");
+    }
+    return ok;
+  }
+
+  void applyHardwareFaultFromCache() {
+    statusFault->setVal((fanState.tempError || fanState.motorError) ? 1 : 0);
   }
 
   boolean update() override {
@@ -351,8 +471,7 @@ struct DeltaAirPurifier : Service::AirPurifier {
       WEBLOG("[HomeKit] 指令：電源 %s（Active=%d）",
              targetPower ? "開" : "關", targetPower);
       if (targetPower == 1) {
-        writeRegisterWithRetry(0x06, 0x04);
-        fanState.speedMode = 0x04;
+        ensureMultiSpeedMode();
       }
 
       if (writeRegisterWithRetry(0x05, targetPower ? 0x01 : 0x00)) {
@@ -367,7 +486,7 @@ struct DeltaAirPurifier : Service::AirPurifier {
 
     if (rotationSpeed->updated()) {
       int targetPercent = (int)rotationSpeed->getNewVal();
-      uint16_t fanLevel = (targetPercent > 0) ? map(targetPercent, 1, 100, 1, 17) : 0;
+      uint16_t fanLevel = percentToFanLevel(targetPercent);
       WEBLOG("[HomeKit] 指令：風速 %d%% → 檔位 %u", targetPercent, fanLevel);
       if (targetPercent > 0) {
         if (writeRegisterWithRetry(0x07, fanLevel)) {
@@ -382,8 +501,7 @@ struct DeltaAirPurifier : Service::AirPurifier {
         // 設風速時若仍為關機，自動開機（Active 同次已更新則交給上方電源邏輯）
         if (!active->updated() && active->getVal() == 0) {
           WEBLOG("[HomeKit] 風速>0，自動開機");
-          writeRegisterWithRetry(0x06, 0x04);
-          fanState.speedMode = 0x04;
+          ensureMultiSpeedMode();
           if (writeRegisterWithRetry(0x05, 0x01)) {
             fanState.power = 0x01;
             active->setVal(1);
@@ -419,73 +537,101 @@ struct DeltaAirPurifier : Service::AirPurifier {
       }
       initOnBoot();
       lastPollTime = millis();
+      lastFilterPollTime = millis();
       return;
     }
 
-    if (millis() - lastPollTime >= POLL_INTERVAL) {
-      lastPollTime = millis();
+    uint32_t now = millis();
+
+    if (now - lastPollTime >= currentPollInterval) {
+      lastPollTime = now;
       pollPurifierStatus();
-      if (filterService) {
-        filterService->pollFilterStatus();
-      }
+    }
+
+    if (filterService && (now - lastFilterPollTime >= POLL_FILTER_MS)) {
+      lastFilterPollTime = now;
+      filterService->pollFilterStatus();
     }
   }
 
-  // 定時巡檢：以 ESP32 (HomeKit) 為絕對真理，若風機狀態跑掉則強制校正
+  // 定時巡檢：以 ESP32 (HomeKit) 為絕對真理，不符則只寫差異並繼續讀診斷
   void pollPurifierStatus() {
-    delay(30);
-    uint8_t res1 = node.readHoldingRegisters(0x05, 3); // 讀取 0x05~0x07[cite: 8]
-    if (res1 == node.ku8MBSuccess) {
-      fanState.modbusOnline = true;
-      uint16_t actualPower = node.getResponseBuffer(0); // 0x05[cite: 8]
-      uint16_t actualMode  = node.getResponseBuffer(1); // 0x06[cite: 8]
-      uint16_t actualLevel = node.getResponseBuffer(2); // 0x07[cite: 8]
+    if (!readHoldingWithGap(0x05, 3)) {
+      fanState.modbusOnline = false;
+      statusFault->setVal(1);
+      WEBLOG("[Monitor] 控制暫存器讀取失敗");
+      return;
+    }
 
-      uint16_t targetPower = (active->getVal() == 1) ? 0x01 : 0x00;
-      uint16_t targetLevel = map((int)rotationSpeed->getVal(), 1, 100, 1, 17);
+    fanState.modbusOnline = true;
+    uint16_t actualPower = node.getResponseBuffer(0); // 0x05
+    uint16_t actualMode  = node.getResponseBuffer(1); // 0x06
+    uint16_t actualLevel = node.getResponseBuffer(2); // 0x07
 
-      // 絕對真理覆寫：只要風機硬體狀態與 HomeKit 目標不符，立刻強制限時覆寫
-      if (actualMode != 0x04 || actualPower != targetPower || (targetPower == 0x01 && actualLevel != targetLevel)) {
-        Serial.println("[Monitor] 偵測到風機狀態與 HomeKit 不符，強制校正中...");
-        initOnBoot();
-        return;
+    uint16_t targetPower = (active->getVal() == 1) ? 0x01 : 0x00;
+    uint16_t targetLevel = percentToFanLevel((int)rotationSpeed->getVal());
+
+    if (actualMode != 0x04 || actualPower != targetPower ||
+        (targetPower == 0x01 && actualLevel != targetLevel)) {
+      WEBLOG("[Monitor] 硬體與 HomeKit 不符（P=%u/%u M=%u L=%u/%u），差異校正…",
+             actualPower, targetPower, actualMode, actualLevel, targetLevel);
+      if (correctToHomeKit(actualPower, actualMode, actualLevel)) {
+        correctFailCount = 0;
+        currentPollInterval = POLL_CONTROL_MS;
+        fanState.power = targetPower;
+        fanState.speedMode = 0x04;
+        if (targetPower == 0x01) {
+          fanState.speedLevel = targetLevel;
+        }
+        fanState.speedPercent = (int)rotationSpeed->getVal();
+      } else {
+        correctFailCount++;
+        if (correctFailCount >= CORRECT_FAIL_THRESHOLD) {
+          statusFault->setVal(1);
+          currentPollInterval = POLL_BACKOFF_MS;
+          WEBLOG("[Monitor] 連續校正失敗 %d 次，下一輪間隔 %lu ms",
+                 correctFailCount, (unsigned long)POLL_BACKOFF_MS);
+        }
       }
-
+    } else {
+      correctFailCount = 0;
+      currentPollInterval = POLL_CONTROL_MS;
       fanState.power = actualPower;
       fanState.speedMode = actualMode;
       fanState.speedLevel = actualLevel;
       fanState.speedPercent = (int)rotationSpeed->getVal();
+    }
 
-    } else {
-      fanState.modbusOnline = false;
-      statusFault->setVal(1);
+    // 診斷讀失敗：保留上次值，不把整機判為 offline
+    if (!readHoldingWithGap(0x0D, 7)) {
+      WEBLOG("[Monitor] 診斷暫存器讀取失敗（保留上次值）");
       return;
     }
 
-    // 讀取純硬體感測與診斷數據：0x0D ~ 0x13[cite: 8, 9]
-    delay(30);
-    uint8_t res2 = node.readHoldingRegisters(0x0D, 7);
-    if (res2 == node.ku8MBSuccess) {
-      fanState.rpm       = node.getResponseBuffer(0); // 0x0D[cite: 8]
-      fanState.errorCode = node.getResponseBuffer(3); // 0x10[cite: 8, 9]
-      fanState.sysStatus = node.getResponseBuffer(6); // 0x13[cite: 8, 9]
+    fanState.rpm       = node.getResponseBuffer(0); // 0x0D
+    fanState.errorCode = node.getResponseBuffer(3); // 0x10
+    fanState.sysStatus = node.getResponseBuffer(6); // 0x13
 
-      fanState.tempError  = (fanState.errorCode & 0x20) != 0; // Bit5[cite: 9]
-      fanState.motorError = (fanState.errorCode & 0x80) != 0; // Bit7[cite: 9]
-      statusFault->setVal((fanState.tempError || fanState.motorError) ? 1 : 0);
+    fanState.tempError  = (fanState.errorCode & 0x20) != 0;
+    fanState.motorError = (fanState.errorCode & 0x80) != 0;
+    // 連續校正失敗時維持 fault；否則依硬體錯誤更新（控制讀成功＝online）
+    if (correctFailCount >= CORRECT_FAIL_THRESHOLD) {
+      statusFault->setVal(1);
+    } else {
+      applyHardwareFaultFromCache();
+    }
 
-      fanState.isRunning       = (fanState.sysStatus & 0x01) != 0; // Bit0[cite: 9]
-      fanState.lowTempProtect  = (fanState.sysStatus & 0x40) != 0; // Bit6[cite: 9]
-      fanState.halfSpeedSwitch = (fanState.sysStatus & 0x80) != 0; // Bit7[cite: 9]
+    fanState.isRunning       = (fanState.sysStatus & 0x01) != 0;
+    fanState.lowTempProtect  = (fanState.sysStatus & 0x40) != 0;
+    fanState.halfSpeedSwitch = (fanState.sysStatus & 0x80) != 0;
 
-      // 0=INACTIVE, 1=IDLE, 2=PURIFYING
-      uint8_t newCurrentState = 0;
-      if (active->getVal() == 1) {
-        newCurrentState = fanState.isRunning ? 2 : 1;
-      }
-      if (currentState->getVal() != newCurrentState) {
-        currentState->setVal(newCurrentState);
-      }
+    // 0=INACTIVE, 1=IDLE, 2=PURIFYING
+    uint8_t newCurrentState = 0;
+    if (active->getVal() == 1) {
+      newCurrentState = fanState.isRunning ? 2 : 1;
+    }
+    if (currentState->getVal() != newCurrentState) {
+      currentState->setVal(newCurrentState);
     }
   }
 };
@@ -498,7 +644,7 @@ void setup() {
   pinMode(DE_RE_PIN, OUTPUT);
   digitalWrite(DE_RE_PIN, LOW);
 #endif
-  Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN); // RS485 鮑率 9600[cite: 7]
+  Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
 
   node.begin(DELTA_FAN_ID, Serial2);
   node.preTransmission(preTransmission);
@@ -564,7 +710,9 @@ void setup() {
 }
 
 void loop() {
+  inHomeSpanPoll = true;
   homeSpan.poll();
+  inHomeSpanPoll = false;
   httpServer.handleClient();
 
   // 有存帳密但一直連不上：前 20 秒照常重連；逾時則開設定熱點（阻塞至儲存/逾時後重啟）
