@@ -5,8 +5,8 @@
 // ================= 硬體腳位與參數定義 =================
 // 自動流向 485：模組 TX→RX_PIN、模組 RX→TX_PIN（無 DE/RE）
 // 若用 JSM485ESA 等需手動 DE/RE，改 USE_RS485_DE_RE=1 並接 DE+RE→DE_RE_PIN
-#define RX_PIN 16
-#define TX_PIN 17
+#define RX_PIN 25
+#define TX_PIN 26
 #define DE_RE_PIN 4
 #define USE_RS485_DE_RE 0
 

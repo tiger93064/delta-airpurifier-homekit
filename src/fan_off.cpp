@@ -8,8 +8,8 @@
 #include <Arduino.h>
 #include <string.h>
 
-#define RX_PIN 16  // ← 485 模組 TX
-#define TX_PIN 17  // ← 485 模組 RX
+#define RX_PIN 25  // ← 485 模組 TX
+#define TX_PIN 26  // ← 485 模組 RX
 
 static const uint32_t BAUD = 9600;
 static const uint16_t REPLY_TIMEOUT_MS = 400;
@@ -146,7 +146,7 @@ void setup() {
   delay(800);
   Serial.println();
   Serial.println("=== 台達風機 RS485 關機 ===");
-  Serial.println("接線: 模組TX→GPIO16, 模組RX→GPIO17");
+  Serial.println("接線: 模組TX→GPIO25, 模組RX→GPIO26");
 
   Serial2.begin(BAUD, SERIAL_8N1, RX_PIN, TX_PIN);
   delay(300);

@@ -10,8 +10,8 @@
 #include <Arduino.h>
 #include <string.h>
 
-#define RX_PIN 16
-#define TX_PIN 17
+#define RX_PIN 25
+#define TX_PIN 26
 
 static const uint8_t FAN_ID = 0xC8;       // 出廠位址；若不同請改
 static const uint32_t BAUD = 9600;

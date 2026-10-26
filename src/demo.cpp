@@ -4,8 +4,8 @@
 #include <esp_task_wdt.h>
 
 // ================= 硬體腳位與參數定義 =================
-#define RX_PIN 16        // 接至 JSM485ESA 的 RO
-#define TX_PIN 17        // 接至 JSM485ESA 的 DI
+#define RX_PIN 25        // 接至 JSM485ESA 的 RO
+#define TX_PIN 26        // 接至 JSM485ESA 的 DI
 #define DE_RE_PIN 4      // 接至 JSM485ESA 的 DE 與 RE
 
 #define WDT_TIMEOUT 15   // 看門狗超時時間 (秒)

@@ -11,8 +11,8 @@
 static const uint32_t BAUD = 9600;
 static const uint16_t REPLY_TIMEOUT_MS = 400;
 
-static uint8_t pinRx = 16;
-static uint8_t pinTx = 17;
+static uint8_t pinRx = 25;
+static uint8_t pinTx = 26;
 static uint32_t totalRxBytes = 0;   // 含可能的迴聲
 static uint32_t realRxBytes = 0;    // 剔除迴聲後
 
@@ -149,7 +149,7 @@ void setup() {
   Serial.println();
   Serial.println("=== 台達風機 位址掃描（自動流向／剔迴聲）===");
   Serial.println("先前「1 byte 無法解析」多半是 TX 迴聲，不是風機。");
-  Serial.println("階段1 有雜訊、階段2 無 → TTL 腳位用階段1（TX→16 RX→17）。");
+  Serial.println("階段1 有雜訊、階段2 無 → TTL 腳位用階段1（TX→25 RX→26）。");
   Serial.println("若仍找不到：對調風機 A/B，確認強-N 有電。");
   Serial.println();
 
@@ -157,9 +157,9 @@ void setup() {
   totalRxBytes = 0;
   realRxBytes = 0;
 
-  // 依上次結果：正確腳位是模組 TX→16、RX→17
-  pinRx = 16;
-  pinTx = 17;
+  // 正確腳位：模組 TX→25、RX→26
+  pinRx = 25;
+  pinTx = 26;
   reopenSerial();
   Serial.println("【階段1】出廠範圍 200~254");
   scanRange(200, 254);
@@ -171,8 +171,8 @@ void setup() {
 
   // 若完全沒有效資料，再試對調腳位一次
   if (foundCount == 0 && realRxBytes == 0) {
-    pinRx = 17;
-    pinTx = 16;
+    pinRx = 26;
+    pinTx = 25;
     reopenSerial();
     Serial.println("【階段3】對調腳位掃 200~254");
     scanRange(200, 254);
